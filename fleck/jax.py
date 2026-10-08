@@ -731,8 +731,8 @@ class ActiveStar:
             (1. - contrast) *
             jnp.expand_dims(frac_occulted_per_time_per_spot, axis=(2, 3))
         )
-        scaled_occultation = ((1. - contaminated_transit)
-                              * jnp.sum(occultation, axis=1)[..., 0])
+        scaled_occultation = ((1. - contaminated_transit) *
+                              jnp.sum(occultation, axis=1)[..., 0])
 
         spectrum_at_transit = time_series_spectrum[t_ind]
 
@@ -1065,6 +1065,6 @@ def spectral_binning(y, all_x, all_y):
     min_ind = np.argwhere(all_y == y[0])[0, 0]
     max_ind = np.argwhere(all_y == y[-1])[0, 0]
     if max_ind > min_ind and y.shape == all_x[min_ind:max_ind + 1].shape:
-        return (np.trapz(y, all_x[min_ind:max_ind + 1])
-                / (all_x[max_ind] - all_x[min_ind]))
+        return (np.trapz(y, all_x[min_ind:max_ind + 1]) /
+                (all_x[max_ind] - all_x[min_ind]))
     return np.nan
