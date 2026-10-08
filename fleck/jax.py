@@ -71,7 +71,9 @@ class ActiveStar:
         wavelength : array
             Wavelength for each flux observation in ``phot`` [meters]
         phot : array
-            Photospheric flux at each ``wavelength``.
+            Photospheric flux at each ``wavelength``. If omitted, use a
+            blackbody when ``T_eff`` and ``wavelength`` are provided,
+            otherwise use unity.
         P_rot : float
             Stellar rotation period
         contrast : float or array
@@ -84,9 +86,10 @@ class ActiveStar:
         self.lon = jnp.array(lon)
         self.lat = jnp.array(lat)
         self.rad = jnp.array(rad)
-        self.spectrum = jnp.array(spectrum)
+        self.spectrum = jnp.array([]) if spectrum is None else jnp.array(spectrum)
         self.T_eff = T_eff
-        self.temperature = jnp.array(temperature)
+        self.temperature = (jnp.array([]) if temperature is None
+                            else jnp.atleast_1d(jnp.asarray(temperature)))
         self.inclination = inclination
         # Allow wavelength/phot to remain optional, but store them as
         # JAX arrays when provided.
@@ -96,10 +99,7 @@ class ActiveStar:
 
         # Raw contrast as passed by the user (may be scalar, 1D, 2D, or
         # empty). We normalise shapes after dimension inference.
-        if contrast is None or getattr(contrast, "size", 0) == 0:
-            self.contrast = jnp.array([])
-        else:
-            self.contrast = jnp.array(contrast)
+        self.contrast = jnp.array([]) if contrast is None else jnp.array(contrast)
 
         # ------------------------------------------------------------------
         # Dimension bookkeeping: infer n_times, n_spots, n_lambda
@@ -152,6 +152,11 @@ class ActiveStar:
             # Absolute last resort: a single "white-light" wavelength bin
             self.n_lambda = 1
 
+        has_temperatures = self.temperature.size != 0
+        self.temperature = (jnp.broadcast_to(self.temperature, (self.n_spots,))
+                            if has_temperatures
+                            else jnp.full((self.n_spots,), jnp.nan))
+
         # Normalise the supplied contrast argument into something at least
         # 2D where possible.
         if self.contrast.size != 0:
@@ -169,22 +174,32 @@ class ActiveStar:
             # If contrast is already 2D+ we assume the user passed
             # (n_spots, n_lambda) and leave it as-is.
 
-        # If we have no phot, set it to unity
-        self.phot = (jnp.asarray(self.phot) if self.phot is not None
-                     else jnp.ones((self.n_lambda,)))
+        if self.phot is None:
+            if self.T_eff is not None and self.wavelength is not None:
+                self.phot = self._blackbody(self.wavelength, self.T_eff)
+            else:
+                self.phot = jnp.ones((self.n_lambda,))
+        self.phot = jnp.broadcast_to(self.phot, (self.n_lambda,))
 
-        # If an explicit contrast was not provided but we do have a
-        # spectrum and photosphere, derive the contrast now.
-        if self.contrast.size == 0 and self.spectrum.size != 0:
-            derived_contrast = self.spectrum / self.phot[None, :]
-            if derived_contrast.ndim == 1:
-                derived_contrast = derived_contrast[None, :]
-            self.contrast = derived_contrast
-
-        # If we have a contrast and a photosphere but no spectrum,
-        # construct a spectrum that is consistent with both.
-        if self.spectrum.size == 0 and self.contrast.size != 0:
+        # Keep spectral arrays aligned along spot and wavelength axes.
+        shape = (self.n_spots, self.n_lambda)
+        if self.contrast.size != 0:
+            self.contrast = jnp.broadcast_to(self.contrast, shape)
             self.spectrum = self.contrast * self.phot[None, :]
+        else:
+            if self.spectrum.size == 0 and has_temperatures:
+                if self.wavelength is None:
+                    raise ValueError("Temperature-based spots require wavelengths.")
+                self.spectrum = self._blackbody(
+                    self.wavelength[None, :], self.temperature[:, None])
+            if self.spectrum.size != 0:
+                if self.spectrum.ndim == 1 and self.n_lambda == 1:
+                    self.spectrum = self.spectrum[:, None]
+                self.spectrum = jnp.broadcast_to(self.spectrum, shape)
+                self.contrast = self.spectrum / self.phot[None, :]
+            else:
+                self.contrast = jnp.zeros(shape)
+                self.spectrum = self.contrast * self.phot[None, :]
 
     def tree_flatten(self):
         children = (
@@ -420,58 +435,38 @@ class ActiveStar:
         """
         if contrast is not None:
             # User-supplied contrast: convert to spectrum
-            contrast = jnp.array(contrast)
-            if contrast.ndim == 0:
-                # Scalar contrast: broadcast to all wavelengths
-                contrast = contrast[None] * jnp.ones(self.n_lambda)
-            elif contrast.ndim == 1:
-                # 1D contrast are defined on the wavelength grid
-                contrast = contrast[None, :]
+            contrast = jnp.broadcast_to(jnp.asarray(contrast).squeeze(),
+                                       (self.n_lambda,))
             # Derive the spectrum from the contrast
-            spectrum = contrast * self.phot[None, :]
+            spectrum = contrast * self.phot
         elif spectrum is not None:
             # User-supplied spectrum: ensure correct shape
-            spectrum = jnp.array(spectrum)
-            if spectrum.ndim == 0:
-                # Scalar spectrum: broadcast to all wavelengths
-                spectrum = spectrum[None] * jnp.ones(self.n_lambda)
-            elif spectrum.ndim == 1:
-                # 1D spectra are defined on the wavelength grid
-                spectrum = spectrum[None, :]
+            spectrum = jnp.broadcast_to(jnp.asarray(spectrum).squeeze(),
+                                       (self.n_lambda,))
             # Derive the contrast from the spectrum
-            contrast = spectrum / self.phot[None, :]
-        elif spectrum is None and temperature is not None:
+            contrast = spectrum / self.phot
+        elif temperature is not None:
             # No contrast or spectrum, but a temperature: compute a blackbody
+            if self.wavelength is None:
+                raise ValueError("Temperature-based spots require wavelengths.")
             spectrum = self._blackbody(self.wavelength, temperature)
-            contrast = spectrum / self.phot[None, :]
-            if contrast.ndim == 1:
-                contrast = contrast[None, :]
+            contrast = spectrum / self.phot
+        else:
+            contrast = jnp.zeros((self.n_lambda,))
+            spectrum = contrast * self.phot
 
-        for attr, new_value in zip(
-            "lon, lat, rad, spectrum, temperature, contrast".split(', '),
-            [lon, lat, rad, spectrum, temperature, contrast],
-        ):
+        for attr, value in (("lon", lon), ("lat", lat), ("rad", rad),
+                            ("temperature", jnp.nan if temperature is None
+                             else temperature)):
+            setattr(self, attr, jnp.concatenate(
+                [jnp.ravel(getattr(self, attr)), jnp.asarray(value).reshape(1)]))
+        self.spectrum = jnp.concatenate([self.spectrum, spectrum[None, :]], axis=0)
+        self.contrast = jnp.concatenate([self.contrast, contrast[None, :]], axis=0)
+        self.n_spots = int(self.rad.size)
 
-            prop = getattr(self, attr)
-
-            if not hasattr(new_value, 'ndim'):
-                new_value = jnp.array([new_value])
-
-            if prop is not None and getattr(prop, "size", 0) != 0:
-                if prop.ndim > 1 or (
-                    len(prop) > 1 and len(prop) == len(new_value)
-                ):
-                    new_value = jnp.vstack([prop, new_value])
-                else:
-                    new_value = jnp.concatenate([prop, new_value])
-
-                setattr(self, attr, new_value)
-
-        # Update n_spots
-        self.n_spots += 1
-
+    @staticmethod
     @jit
-    def _blackbody(self, wavelength_meters, temperature):
+    def _blackbody(wavelength_meters, temperature):
         """
         Compute a blackbody spectrum.
         """
@@ -847,16 +842,19 @@ class ActiveStar:
         if ax is None:
             ax = plt.gca()
 
-        if self.temperature is not None:
-            log_temps = np.log10(self.temperature)
+        temperatures = np.asarray(self.temperature)
+        known_temperatures = np.isfinite(temperatures) & (temperatures > 0)
+        color_temperatures = temperatures[known_temperatures]
+        if self.T_eff is not None:
+            color_temperatures = np.append(color_temperatures, self.T_eff)
+        log_temps = np.log10(color_temperatures)
+        log_min = log_temps.min() if log_temps.size else 0.
+        log_max = log_temps.max() if log_temps.size else 0.
 
         def temp_cmap(x):
-            return to_hex(
-                plt.cm.YlOrRd_r(
-                    (np.log10(x) - min(log_temps)) /
-                    (self.T_eff - min(log_temps)) * 0.6 + 0.4
-                )
-            )
+            fraction = ((np.log10(x) - log_min) / (log_max - log_min)
+                        if log_max > log_min else 1.)
+            return to_hex(plt.cm.YlOrRd_r(fraction * 0.6 + 0.4))
 
         if self.T_eff is None:
             color = 'white'
@@ -899,11 +897,11 @@ class ActiveStar:
             z = spot_z_np[i]
             c = contr_np[i]
 
-            if len(self.temperature) == 0:
-                color = 'k'
-                alpha = 1-c
+            if not known_temperatures[i]:
+                color = 'k' if c <= 1 else 'white'
+                alpha = np.clip(abs(1-c), 0, 1)
             else:
-                color = temp_cmap(self.temperature[i])
+                color = temp_cmap(temperatures[i])
                 alpha = 1
 
             if z < 0:
@@ -918,7 +916,7 @@ class ActiveStar:
                 )
                 ax.add_patch(ell)
 
-                if annotate and len(self.temperature) == 0:
+                if annotate and not known_temperatures[i]:
                     ax.annotate(
                         f"{i+1}: {c:.2f}", (y, x),
                         va='center', ha='center', fontsize=6
